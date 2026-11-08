@@ -1,0 +1,1145 @@
+theory UAV_Compromise_FS
+begin
+
+
+/* ============================================================
+   04_compromise.spthy
+
+   Goal:
+
+   Verify forward secrecy of an already completed G-domain
+   mobility-authentication session.
+
+   After SessionComplete, the adversary is deliberately given:
+
+       1. Target long-term signing key
+       2. G-domain derived root
+       3. Past/base state signing key
+
+   The adversary is NOT given the erased ephemeral DH secrets:
+
+       x_U
+       x_T
+
+   We verify that the past application/session key K_app
+   remains unknown.
+
+   ============================================================ */
+
+
+builtins: hashing, signing, diffie-hellman
+
+
+functions:
+    domain_root/2,
+    auth_key/4,
+    h2s/1,
+    hkdf_extract/2,
+    hkdf_expand/2,
+    mac/2
+
+
+
+/* ============================================================
+   Restrict this staging model to one enrollment.
+
+   This keeps the forward-secrecy model acyclic and prevents
+   unrelated registrations from obscuring the compromise trace.
+   ============================================================ */
+
+restriction OnlyOneSetup:
+    "All #i #j.
+        OnlyOnce() @ i
+        & OnlyOnce() @ j
+        ==> #i = #j"
+
+
+
+/* ============================================================
+   RULE 1
+   Trusted enrollment / initial identity state
+   ============================================================ */
+
+rule Setup_G:
+
+    let
+
+        pkca =
+            pk(~skca)
+
+        pkt =
+            pk(~skt)
+
+        kg =
+            domain_root(
+                ~ku,
+                'domain_g'
+            )
+
+        sk0 =
+            h2s(
+                auth_key(
+                    kg,
+                    ~pid,
+                    'v0',
+                    ~cv0
+                )
+            )
+
+        pk0 =
+            pk(sk0)
+
+        rho0 =
+            h(
+                < 'state',
+                  'domain_g',
+                  ~pid,
+                  'v0',
+                  ~cv0,
+                  pk0 >
+            )
+
+        certbody =
+            h(
+                < 'cert',
+                  'domain_g',
+                  'target',
+                  pkt >
+            )
+
+        certsig =
+            sign(
+                certbody,
+                ~skca
+            )
+
+    in
+
+    [
+        Fr(~skca),
+        Fr(~skt),
+        Fr(~ku),
+        Fr(~pid),
+        Fr(~cv0)
+    ]
+
+    --[
+        OnlyOnce()
+    ]->
+
+    [
+        !CA_G(pkca),
+
+        !TargetCred_G(
+            ~skt,
+            pkt,
+            certsig
+        ),
+
+        !UAVRoot_G(
+            ~ku,
+            ~pid
+        ),
+
+        !PID_G(~pid),
+
+        UAVInitial_G(
+            ~pid,
+            ~cv0,
+            pk0,
+            rho0
+        ),
+
+        CSInitial_G(
+            ~pid,
+            ~cv0,
+            pk0,
+            rho0
+        ),
+
+        StartFS_G(),
+
+        /*
+         * The following persistent facts are NOT attacker
+         * knowledge.
+         *
+         * They are instrumentation facts used solely to model
+         * the post-session reveal oracle.
+         *
+         * Their existence must not be interpreted as actual
+         * persistent storage in the implementation.
+         */
+
+        !RevealTargetMaterial_G(
+            ~pid,
+            ~skt
+        ),
+
+        !RevealDomainRootMaterial_G(
+            ~pid,
+            kg
+        ),
+
+        !RevealPastStateKeyMaterial_G(
+            ~pid,
+            sk0
+        ),
+
+        /* Public data */
+        Out(pkca),
+        Out(pkt),
+        Out(pk0),
+        Out(~pid)
+    ]
+
+
+
+/* ============================================================
+   RULE 2
+   Target creates P_G / PreAuth
+
+       x_T   <- fresh
+       X_T   = g^x_T
+
+   The fresh exponent xtsec is never placed on the public
+   network and there is no compromise rule for it.
+   ============================================================ */
+
+rule Target_Prepare_P:
+
+    let
+
+        xtpub =
+            'g' ^ ~xtsec
+
+        tctx =
+            h(
+                < 'tctx',
+                  'domain_g',
+                  ~sid,
+                  pid,
+                  'target',
+                  ~epoch,
+                  xtpub >
+            )
+
+        preauth =
+            sign(
+                h(
+                    < 'preauth',
+                      tctx >
+                ),
+                skt
+            )
+
+    in
+
+    [
+        StartFS_G(),
+
+        !TargetCred_G(
+            skt,
+            pkt,
+            certsig
+        ),
+
+        !PID_G(pid),
+
+        Fr(~sid),
+        Fr(~epoch),
+        Fr(~xtsec)
+    ]
+
+    --[
+        TargetSendP(
+            pid,
+            ~sid,
+            ~epoch,
+            tctx
+        )
+    ]->
+
+    [
+        Authz_G(
+            pid,
+            ~epoch
+        ),
+
+        TargetPrepared_G(
+            pid,
+            ~sid,
+            ~epoch,
+            ~xtsec,
+            xtpub,
+            tctx
+        ),
+
+        Out(~epoch),
+
+        Out(
+            < 'p_msg',
+              'domain_g',
+              ~sid,
+              xtpub,
+
+              < 'cert_record',
+                'domain_g',
+                'target',
+                pkt,
+                certsig >,
+
+              preauth >
+        )
+    ]
+
+
+
+/* ============================================================
+   RULE 3
+   UAV authenticates Target and creates M1_G
+
+       x_U   <- fresh
+       X_U   = g^x_U
+
+   Current state signing key sk0 is reconstructed on demand.
+
+   A candidate state S1 is generated.
+
+   ============================================================ */
+
+rule UAV_Receive_P_Send_M1:
+
+    let
+
+        certbody =
+            h(
+                < 'cert',
+                  'domain_g',
+                  'target',
+                  pkt >
+            )
+
+        tctx =
+            h(
+                < 'tctx',
+                  'domain_g',
+                  sid,
+                  pid,
+                  'target',
+                  epoch,
+                  xtpub >
+            )
+
+        premsg =
+            h(
+                < 'preauth',
+                  tctx >
+            )
+
+        xupub =
+            'g' ^ ~xusec
+
+        kg =
+            domain_root(
+                ku,
+                'domain_g'
+            )
+
+        cv1 =
+            h(
+                < 'next',
+                  rho0,
+                  tctx,
+                  xupub,
+                  'v1' >
+            )
+
+        sk1 =
+            h2s(
+                auth_key(
+                    kg,
+                    pid,
+                    'v1',
+                    cv1
+                )
+            )
+
+        pk1 =
+            pk(sk1)
+
+        rho1 =
+            h(
+                < 'state',
+                  'domain_g',
+                  pid,
+                  'v1',
+                  cv1,
+                  pk1 >
+            )
+
+        pd =
+            h(
+                < 'pending',
+                  tctx,
+                  rho0,
+                  'v1',
+                  cv1,
+                  pk1 >
+            )
+
+        th0 =
+            h(
+                < 'th0',
+                  tctx >
+            )
+
+        th1 =
+            h(
+                < 'th1',
+                  th0,
+                  xupub,
+                  pd >
+            )
+
+        sk0 =
+            h2s(
+                auth_key(
+                    kg,
+                    pid,
+                    'v0',
+                    cv0
+                )
+            )
+
+        sigma =
+            sign(
+                h(
+                    < 'uav_auth',
+                      th1 >
+                ),
+                sk0
+            )
+
+    in
+
+    [
+        UAVInitial_G(
+            pid,
+            cv0,
+            pk0,
+            rho0
+        ),
+
+        !UAVRoot_G(
+            ku,
+            pid
+        ),
+
+        !CA_G(pkca),
+
+        Authz_G(
+            pid,
+            epoch
+        ),
+
+        Fr(~xusec),
+
+        In(
+            < 'p_msg',
+              'domain_g',
+              sid,
+              xtpub,
+
+              < 'cert_record',
+                'domain_g',
+                'target',
+                pkt,
+                certsig >,
+
+              preauth >
+        )
+    ]
+
+    --[
+        _restrict(
+            verify(
+                certsig,
+                certbody,
+                pkca
+            ) = true
+        ),
+
+        _restrict(
+            verify(
+                preauth,
+                premsg,
+                pkt
+            ) = true
+        ),
+
+        _restrict(
+            pk(sk0) = pk0
+        ),
+
+        UAVSendM1(
+            pid,
+            sid,
+            epoch,
+            th1
+        )
+    ]->
+
+    [
+        UAVWaitM2_G(
+            pid,
+            sid,
+            epoch,
+
+            rho0,
+
+            cv1,
+            pk1,
+            rho1,
+
+            th1,
+
+            ~xusec,
+            xtpub,
+            tctx
+        ),
+
+        Out(
+            < 'm1_msg',
+              sid,
+              rho0,
+              xupub,
+              pk1,
+              sigma >
+        )
+    ]
+
+
+
+/* ============================================================
+   RULE 4
+   Target authenticates M1 and creates M2
+
+       Z_T = X_U ^ x_T
+
+   Session keys are derived only from the ephemeral DH secret
+   and the bound transcript/context.
+
+   ============================================================ */
+
+rule Target_Receive_M1_Send_M2:
+
+    let
+
+        cv1 =
+            h(
+                < 'next',
+                  rho0,
+                  tctx,
+                  xupub,
+                  'v1' >
+            )
+
+        rho1 =
+            h(
+                < 'state',
+                  'domain_g',
+                  pid,
+                  'v1',
+                  cv1,
+                  pk1 >
+            )
+
+        pd =
+            h(
+                < 'pending',
+                  tctx,
+                  rho0,
+                  'v1',
+                  cv1,
+                  pk1 >
+            )
+
+        th0 =
+            h(
+                < 'th0',
+                  tctx >
+            )
+
+        th1 =
+            h(
+                < 'th1',
+                  th0,
+                  xupub,
+                  pd >
+            )
+
+        ztarget =
+            xupub ^ xtsec
+
+        actx =
+            h(
+                < 'actx',
+                  tctx,
+                  rho0 >
+            )
+
+        prk =
+            hkdf_extract(
+                actx,
+                ztarget
+            )
+
+        kcf =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'kconf',
+                      th1 >
+                )
+            )
+
+        kcm =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'kcommit',
+                      th1 >
+                )
+            )
+
+        kapp =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'appkey',
+                      th1 >
+                )
+            )
+
+        taut =
+            mac(
+                kcf,
+                h(
+                    < 'target_confirm',
+                      th1 >
+                )
+            )
+
+        th2 =
+            h(
+                < 'th2',
+                  th1,
+                  taut >
+            )
+
+    in
+
+    [
+        TargetPrepared_G(
+            pid,
+            sid,
+            epoch,
+            xtsec,
+            xtpub,
+            tctx
+        ),
+
+        CSInitial_G(
+            pid,
+            cv0,
+            pk0,
+            rho0
+        ),
+
+        In(
+            < 'm1_msg',
+              sid,
+              rho0,
+              xupub,
+              pk1,
+              sigma >
+        )
+    ]
+
+    --[
+        _restrict(
+            verify(
+                sigma,
+                h(
+                    < 'uav_auth',
+                      th1 >
+                ),
+                pk0
+            ) = true
+        ),
+
+        TargetAcceptUAV(
+            pid,
+            sid,
+            epoch
+        ),
+
+        SessionKeyTarget(
+            pid,
+            sid,
+            kapp
+        )
+    ]->
+
+    [
+        TargetAwaitM3_G(
+            pid,
+            sid,
+            epoch,
+
+            cv1,
+            pk1,
+            rho1,
+
+            th2,
+            kcm,
+            kapp
+        ),
+
+        Out(
+            < 'm2_msg',
+              sid,
+              taut >
+        )
+    ]
+
+
+
+/* ============================================================
+   RULE 5
+   UAV verifies M2, derives identical K_app,
+   activates S1, and sends M3
+
+       Z_U = X_T ^ x_U
+
+   DH built-in theory gives:
+
+       (g^x_U)^x_T = (g^x_T)^x_U
+   ============================================================ */
+
+rule UAV_Receive_M2_Send_M3:
+
+    let
+
+        zuav =
+            xtpub ^ xusec
+
+        actx =
+            h(
+                < 'actx',
+                  tctx,
+                  rho0 >
+            )
+
+        prk =
+            hkdf_extract(
+                actx,
+                zuav
+            )
+
+        kcf =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'kconf',
+                      th1 >
+                )
+            )
+
+        kcm =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'kcommit',
+                      th1 >
+                )
+            )
+
+        kapp =
+            hkdf_expand(
+                prk,
+                h(
+                    < 'appkey',
+                      th1 >
+                )
+            )
+
+        expectedtaut =
+            mac(
+                kcf,
+                h(
+                    < 'target_confirm',
+                      th1 >
+                )
+            )
+
+        th2 =
+            h(
+                < 'th2',
+                  th1,
+                  taut >
+            )
+
+        tauc =
+            mac(
+                kcm,
+                h(
+                    < 'commit',
+                      th2 >
+                )
+            )
+
+    in
+
+    [
+        UAVWaitM2_G(
+            pid,
+            sid,
+            epoch,
+
+            rho0,
+
+            cv1,
+            pk1,
+            rho1,
+
+            th1,
+
+            xusec,
+            xtpub,
+            tctx
+        ),
+
+        In(
+            < 'm2_msg',
+              sid,
+              taut >
+        )
+    ]
+
+    --[
+        _restrict(
+            taut = expectedtaut
+        ),
+
+        UAVAcceptTarget(
+            pid,
+            sid,
+            epoch
+        ),
+
+        SessionKeyUAV(
+            pid,
+            sid,
+            kapp
+        )
+    ]->
+
+    [
+        UAVActivated_G(
+            pid,
+            cv1,
+            pk1,
+            rho1
+        ),
+
+        Out(
+            < 'm3_msg',
+              sid,
+              tauc >
+        )
+    ]
+
+
+
+/* ============================================================
+   RULE 6
+   Target verifies M3 and completes the old session
+
+   Only AFTER this rule may the post-session compromise rule
+   become enabled.
+
+   ============================================================ */
+
+rule Target_Receive_M3_Commit:
+
+    let
+
+        expectedtauc =
+            mac(
+                kcm,
+                h(
+                    < 'commit',
+                      th2 >
+                )
+            )
+
+    in
+
+    [
+        TargetAwaitM3_G(
+            pid,
+            sid,
+            epoch,
+
+            cv1,
+            pk1,
+            rho1,
+
+            th2,
+            kcm,
+            kapp
+        ),
+
+        In(
+            < 'm3_msg',
+              sid,
+              tauc >
+        )
+    ]
+
+    --[
+        _restrict(
+            tauc = expectedtauc
+        ),
+
+        TargetCommit(
+            pid,
+            sid,
+            kapp
+        ),
+
+        SessionComplete(
+            pid,
+            sid,
+            kapp
+        )
+    ]->
+
+    [
+        CSCommitted_G(
+            pid,
+            cv1,
+            pk1,
+            rho1
+        ),
+
+        /*
+         * This token is the ONLY way to enable compromise.
+         *
+         * Therefore the modeled compromise necessarily occurs
+         * after successful completion of this session.
+         */
+
+        CompromiseReady_G(
+            pid,
+            sid,
+            kapp
+        )
+    ]
+
+
+
+/* ============================================================
+   RULE 7
+   Combined POST-SESSION compromise
+
+   The adversary receives all of:
+
+       target long-term signing key
+       G-domain root
+       OLD state signing key sk0
+
+   simultaneously.
+
+   This is deliberately stronger than revealing any one of
+   these credentials individually.
+
+   Ephemeral DH exponents x_U and x_T are NOT revealed.
+
+   ============================================================ */
+
+rule Post_Session_Compromise:
+
+    [
+        CompromiseReady_G(
+            pid,
+            sid,
+            kapp
+        ),
+
+        !RevealTargetMaterial_G(
+            pid,
+            skt
+        ),
+
+        !RevealDomainRootMaterial_G(
+            pid,
+            kg
+        ),
+
+        !RevealPastStateKeyMaterial_G(
+            pid,
+            sk0
+        )
+    ]
+
+    --[
+        PostSessionCompromise(
+            pid,
+            sid,
+            kapp
+        ),
+
+        RevealTargetLongTermKey(
+            pid,
+            skt
+        ),
+
+        RevealDomainRoot(
+            pid,
+            kg
+        ),
+
+        RevealPastStateKey(
+            pid,
+            sk0
+        )
+    ]->
+
+    [
+        Out(skt),
+        Out(kg),
+        Out(sk0)
+    ]
+
+
+
+/* ============================================================
+   LEMMA 1
+   Executability of the forward-secrecy experiment
+
+   There must exist a trace in which:
+
+       session completes
+       THEN
+       post-session compromise occurs
+
+   This prevents the FS theorem from being vacuous.
+   ============================================================ */
+
+lemma fs_executable:
+    exists-trace
+    "
+        Ex pid sid key #i #j.
+
+            SessionComplete(
+                pid,
+                sid,
+                key
+            ) @ i
+
+          &
+
+            PostSessionCompromise(
+                pid,
+                sid,
+                key
+            ) @ j
+
+          & i < j
+    "
+
+
+
+/* ============================================================
+   LEMMA 2
+   Compromise ordering
+
+   Any modeled credential compromise must correspond to
+   a previously completed session.
+
+   ============================================================ */
+
+lemma compromise_is_post_session:
+    "
+        All pid sid key #j.
+
+            PostSessionCompromise(
+                pid,
+                sid,
+                key
+            ) @ j
+
+        ==>
+
+            (
+                Ex #i.
+
+                    SessionComplete(
+                        pid,
+                        sid,
+                        key
+                    ) @ i
+
+                  & i < j
+            )
+    "
+
+
+
+/* ============================================================
+   LEMMA 3
+   Forward secrecy under COMBINED post-session compromise
+
+   Even after revealing:
+
+       sk_T
+       kappa_G
+       old state signing key sk_0
+
+   the application/session key of the already-completed
+   session must remain outside adversarial knowledge.
+
+   ============================================================ */
+
+lemma forward_secrecy_combined_compromise:
+    "
+        All pid sid key #i #j.
+
+            SessionComplete(
+                pid,
+                sid,
+                key
+            ) @ i
+
+          &
+
+            PostSessionCompromise(
+                pid,
+                sid,
+                key
+            ) @ j
+
+          & i < j
+
+        ==>
+
+            not (
+                Ex #k.
+                    K(key) @ k
+            )
+    "
+
+
+end

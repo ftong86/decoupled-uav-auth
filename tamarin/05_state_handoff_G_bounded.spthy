@@ -1,0 +1,268 @@
+theory UAV_State_Handoff_G_Bounded
+begin
+
+/*
+  State-ownership regression model for one domain (G).
+  At most two successive handoffs per UAV:
+     gs0 -> gs1 -> gs2, or competing gs0 -> gs_alt.
+  The MM may issue overlapping authorizations. Only the owner can
+  send a state transfer. M2/M3 authentication is abstracted because
+  the original 01-04 models already handle cryptographic checks.
+  This is a BOUNDED handoff model, not an unbounded mobility or cross-domain proof.
+*/
+
+/* Each initialization creates a fresh UAV identifier and initial state. */
+rule Initialize:
+  [ Fr(~u), Fr(~s0) ]
+  --[ OwnerGranted(~u, 'gs0', 'e0') ]->
+  [ Owner0Ready(~u, ~s0),
+    UAVInitial(~u, ~s0),
+    MMPhase0(~u) ]
+
+/*
+  Finite authorization schedule: all three authorizations may be
+  issued before the first handoff. No unbounded MM issuance rule.
+*/
+rule MM_Authorize_First:
+  [ MMPhase0(u), Fr(~e1) ]
+  --[ AuthIssued(u, 'gs1', ~e1) ]->
+  [ MMPhase1(u), !AuthFirst(u, ~e1) ]
+
+rule MM_Authorize_Alternative:
+  [ MMPhase1(u), Fr(~ex) ]
+  --[ AuthIssued(u, 'gs_alt', ~ex) ]->
+  [ MMPhase2(u), !AuthAlternative(u, ~ex) ]
+
+rule MM_Authorize_Next:
+  [ MMPhase2(u), Fr(~e2) ]
+  --[ AuthIssued(u, 'gs2', ~e2) ]->
+  [ !AuthNext(u, ~e2) ]
+
+/*
+  Competing initial transfers consume the SAME linear owner fact.
+  Even when both target authorizations exist, only one can succeed.
+*/
+rule Transfer_GS0_To_GS1:
+  [ Owner0Ready(u, sc), !AuthFirst(u, e1) ]
+  --[ OwnerReleased(u, 'gs0', 'e0'),
+      TransferToFirst(u),
+      TransferSent(u, 'gs0', 'gs1', 'e0', e1) ]->
+  [ InFlight01(u, sc, e1) ]
+
+rule Transfer_GS0_To_Alternative:
+  [ Owner0Ready(u, sc), !AuthAlternative(u, ex) ]
+  --[ OwnerReleased(u, 'gs0', 'e0'),
+      TransferToAlternative(u),
+      TransferSent(u, 'gs0', 'gs_alt', 'e0', ex) ]->
+  [ InFlight0X(u, sc, ex) ]
+
+rule Accept_GS1:
+  [ InFlight01(u, sc, e1) ]
+  --[ OwnerGranted(u, 'gs1', e1),
+      TransferAccepted(u, 'gs0', 'gs1', 'e0', e1) ]->
+  [ Owner1Prepared(u, sc, 'none', e1) ]
+
+rule Accept_Alternative:
+  [ InFlight0X(u, sc, ex) ]
+  --[ OwnerGranted(u, 'gs_alt', ex),
+      TransferAccepted(u, 'gs0', 'gs_alt', 'e0', ex) ]->
+  [ OwnerAlternative(u, sc, ex) ]
+
+/* A prepared session may expire without installing a successor. */
+rule Prepared_Expire1:
+  [ Owner1Prepared(u, sc, pi, e1) ]
+  --[ PreparedExpired(u, 'gs1', e1) ]->
+  [ Owner1Ready(u, sc, pi, e1) ]
+
+/* A valid M1 installs a one-step pending state at gs1. */
+rule Begin_Normal1:
+  [ Owner1Prepared(u, sc, 'none', e1),
+    UAVInitial(u, sc), Fr(~next), Fr(~sid) ]
+  --[ StateWritten(u, 'gs1', e1),
+      PendingInstalled(u, sc, ~next, e1) ]->
+  [ Owner1AwaitM3(u, sc, ~next, e1, ~sid),
+    UAVBase1(u, sc, e1),
+    StoredM2_1(u, sc, ~next, e1, ~sid) ]
+
+/* The old M2 can arrive before or after the old session expires. */
+rule UAV_Accept_M2_1:
+  [ UAVBase1(u, sc, e1),
+    StoredM2_1(u, sc, next, e1, sid) ]
+  --[ UAVActivated(u, next, e1) ]->
+  [ UAVNext1(u, next, e1),
+    CommitMessage1(u, next, e1, sid) ]
+
+/* Committed session: the old gs1 session becomes transferable. */
+rule Commit1:
+  [ Owner1AwaitM3(u, sc, next, e1, sid),
+    CommitMessage1(u, next, e1, sid) ]
+  --[ StateWritten(u, 'gs1', e1),
+      SessionCommitted(u, 'gs1', e1) ]->
+  [ Owner1Ready(u, next, 'none', e1) ]
+
+/* Expired session: retain the previous committed and pending states. */
+rule AwaitM3_Expire1:
+  [ Owner1AwaitM3(u, sc, next, e1, sid) ]
+  --[ SessionExpired(u, 'gs1', e1) ]->
+  [ Owner1Ready(u, sc, <sc, next, e1, sid>, e1) ]
+
+/* The next source is gs1, and only gs1 can transfer its current state. */
+rule Transfer_GS1_To_GS2:
+  [ Owner1Ready(u, sc, pi, e1), !AuthNext(u, e2) ]
+  --[ OwnerReleased(u, 'gs1', e1),
+      TransferSent(u, 'gs1', 'gs2', e1, e2) ]->
+  [ InFlight12(u, sc, pi, e1, e2) ]
+
+rule Accept_GS2:
+  [ InFlight12(u, sc, pi, e1, e2) ]
+  --[ OwnerGranted(u, 'gs2', e2),
+      TransferAccepted(u, 'gs1', 'gs2', e1, e2) ]->
+  [ Owner2Prepared(u, sc, pi, e2) ]
+
+/*
+  M2Recover: UAV stayed on the committed base. Old pending
+  is replaced by a new one-step successor without promotion.
+*/
+rule M2Recover_At_GS2:
+  [ Owner2Prepared(u, sc, <sc, oldNext, oldE, oldSid>, e2),
+    UAVBase1(u, sc, oldE),
+    Fr(~newNext), Fr(~newSid) ]
+  --[ StateWritten(u, 'gs2', e2),
+      M2Recovery(u, sc, oldNext, ~newNext),
+      RecoveryAfterExpiry(u, oldE) ]->
+  [ Owner2AwaitM3(u, sc, ~newNext, e2, ~newSid),
+    UAVBase2(u, sc, e2),
+    StoredM2_2(u, sc, ~newNext, e2, ~newSid) ]
+
+/*
+  M3Recover: UAV activated the old pending successor.
+  Promotion occurs while gs2 installs a fresh pending successor.
+*/
+rule M3Recover_At_GS2:
+  [ Owner2Prepared(u, sc, <sc, oldNext, oldE, oldSid>, e2),
+    UAVNext1(u, oldNext, oldE),
+    Fr(~newNext), Fr(~newSid) ]
+  --[ StateWritten(u, 'gs2', e2),
+      M3Recovery(u, sc, oldNext, ~newNext),
+      RecoveryAfterExpiry(u, oldE) ]->
+  [ Owner2AwaitM3(u, oldNext, ~newNext, e2, ~newSid),
+    UAVBase2(u, oldNext, e2),
+    StoredM2_2(u, oldNext, ~newNext, e2, ~newSid) ]
+
+/*
+  The new M2 must be accepted by the UAV before gs2 can commit.
+  CommitMessage2 abstracts the authenticated M3 of the new session.
+*/
+rule UAV_Accept_M2_2:
+  [ UAVBase2(u, base, e2),
+    StoredM2_2(u, base, next, e2, sid) ]
+  --[ UAVActivated(u, next, e2),
+      UAVConfirmed2(u, base, next, e2, sid) ]->
+  [ UAVNext2(u, next, e2),
+    CommitMessage2(u, base, next, e2, sid) ]
+
+rule Commit2:
+  [ Owner2AwaitM3(u, base, next, e2, sid),
+    CommitMessage2(u, base, next, e2, sid) ]
+  --[ StateWritten(u, 'gs2', e2),
+      SessionCommitted(u, 'gs2', e2),
+      SecondCommit(u, base, next, e2, sid) ]->
+  [ Owner2Ready(u, next, 'none', e2) ]
+
+
+/* SAFETY: any later grant requires release of the preceding owner. */
+lemma authority_grants_are_sequential:
+  "All u a b ea eb #i #j.
+     OwnerGranted(u,a,ea) @ #i
+     & OwnerGranted(u,b,eb) @ #j
+     & #i < #j
+     ==>
+     (Ex #k. OwnerReleased(u,a,ea) @ #k
+       & #i < #k & #k < #j)"
+
+/* SAFETY: released authority can never modify state afterward. */
+lemma no_write_after_release:
+  "All u a e #i #j.
+     OwnerReleased(u,a,e) @ #i
+     & StateWritten(u,a,e) @ #j
+     ==> #j < #i"
+
+/* SAFETY: competing targets cannot both obtain the initial handoff. */
+lemma conflicting_handoffs_excluded:
+  "not (Ex u #i #j.
+     TransferToFirst(u) @ #i
+     & TransferToAlternative(u) @ #j)"
+
+/* SAFETY: an accepted transfer must have an actual source event. */
+lemma accepted_transfer_has_source:
+  "All u src dest oldE newE #i.
+     TransferAccepted(u,src,dest,oldE,newE) @ #i
+     ==>
+     (Ex #j. TransferSent(u,src,dest,oldE,newE) @ #j
+       & #j < #i)"
+
+/* SAFETY: a GS1 handoff requires a preceding terminal session state. */
+lemma handoff_requires_terminal_session:
+  "All u e1 e2 #i.
+     TransferSent(u,'gs1','gs2',e1,e2) @ #i
+     ==>
+     ((Ex #j. PreparedExpired(u,'gs1',e1) @ #j & #j < #i)
+      | (Ex #k. SessionExpired(u,'gs1',e1) @ #k & #k < #i)
+      | (Ex #l. SessionCommitted(u,'gs1',e1) @ #l & #l < #i))"
+
+/* SAFETY: recovery from pending state requires earlier expiry. */
+lemma recovery_requires_prior_expiration:
+  "All u e1 #i.
+     RecoveryAfterExpiry(u,e1) @ #i
+     ==>
+     (Ex #j. SessionExpired(u,'gs1',e1) @ #j & #j < #i)"
+
+/* SAFETY: the second target commits only after the UAV accepts its M2. */
+lemma second_commit_requires_uav_confirmation:
+  "All u base next e sid #i.
+     SecondCommit(u,base,next,e,sid) @ #i
+     ==>
+     (Ex #j. UAVConfirmed2(u,base,next,e,sid) @ #j & #j < #i)"
+
+/* NONVACUITY: overlapping authorizations are possible before handoff. */
+lemma overlapping_authorizations_executable:
+  exists-trace
+  "Ex u e1 ex #i #j #k.
+     AuthIssued(u,'gs1',e1) @ #i
+     & AuthIssued(u,'gs_alt',ex) @ #j
+     & TransferToFirst(u) @ #k
+     & #i < #j & #j < #k"
+
+/* NONVACUITY: both alternative targets can be selected separately. */
+lemma alternative_target_executable:
+  exists-trace
+  "Ex u #i. TransferToAlternative(u) @ #i"
+
+/* NONVACUITY: two consecutive handoffs can occur. */
+lemma two_handoffs_executable:
+  exists-trace
+  "Ex u e1 e2 #i #j.
+     TransferSent(u,'gs0','gs1','e0',e1) @ #i
+     & TransferSent(u,'gs1','gs2',e1,e2) @ #j
+     & #i < #j"
+
+/* NONVACUITY: ordinary confirmation and commit still work. */
+lemma normal_commit_executable:
+  exists-trace
+  "Ex u e #i. SessionCommitted(u,'gs1',e) @ #i"
+
+/* NONVACUITY: both recovery branches remain reachable. */
+lemma m2_recovery_executable:
+  exists-trace
+  "Ex u sc old next #i. M2Recovery(u,sc,old,next) @ #i"
+
+lemma m3_recovery_executable:
+  exists-trace
+  "Ex u sc old next #i. M3Recovery(u,sc,old,next) @ #i"
+
+/* NONVACUITY: recovery can progress through a later commitment. */
+lemma recovery_commit_executable:
+  exists-trace
+  "Ex u e #i. SessionCommitted(u,'gs2',e) @ #i"
+
+end
