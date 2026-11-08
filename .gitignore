@@ -1,0 +1,117 @@
+# ---------------------------------------------------------------------------
+# decoupled-uav-auth: source-only public repository
+# Only experimental implementations are versioned. Every generated artefact,
+# dataset, credential and local cache stays out of Git.
+# ---------------------------------------------------------------------------
+
+# --- Credentials, keys and local environment -------------------------------
+*.pem
+*.ppk
+*.key
+*.p12
+*.pfx
+*_KEY*
+.env
+.env.*
+*.env
+secrets/
+credentials/
+
+# --- Experimental results and datasets (never published) ------------------
+*.csv
+*.tsv
+*.jsonl
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.pcap
+*.pcapng
+*.tr
+*.out
+*.err
+*.log
+results/
+results_*/
+runs/
+run_*/
+scenes/
+simulation_output/
+archives/
+reports/
+data/
+analysis/
+plots/
+figures/
+figs/
+tables/
+output/
+outputs/
+
+# --- Proof / figure artefacts ---------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.eps
+*.pdf
+*.html
+*_screenshot.html
+proof_images/
+
+# --- Build products and caches --------------------------------------------
+build/
+build-*/
+cmake-cache/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+bench_openssl
+bench_pairing
+gen_typea_param
+crypto_bench
+crypto_bench_pbc128
+
+# --- Backups, archives, partial downloads ---------------------------------
+*.zip
+*.zip.*
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.7z
+*.rar
+*.crdownload
+*.part
+*.part-*
+*.bak
+*.orig
+*.pnet_patched
+*~
+*.swp
+
+# --- Local tooling / editor / OS ------------------------------------------
+.git/
+.workbuddy/
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+.current_run_id
