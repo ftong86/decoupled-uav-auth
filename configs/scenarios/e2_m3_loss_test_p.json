@@ -1,0 +1,500 @@
+{
+  "name": "e2_lte_ho_protocol_M3_LOSS_TEST_ONLY",
+  "resultsPath": "./results/e2_m3_loss_test_p/sim/",
+  "logOnFile": true,
+  "duration": 90.0,
+  "staticNs3Config": [
+    {
+      "name": "ns3::TcpSocket::SegmentSize",
+      "value": "1380"
+    },
+    {
+      "name": "ns3::LteHelper::HandoverAlgorithm",
+      "value": "ns3::A3RsrpHandoverAlgorithm"
+    }
+  ],
+  "world": {
+    "size": {
+      "X": "1000",
+      "Y": "1000",
+      "Z": "120"
+    },
+    "buildings": [],
+    "regionsOfInterest": []
+  },
+  "phyLayer": [
+    {
+      "type": "lte",
+      "attributes": [],
+      "channel": {
+        "propagationLossModel": {
+          "name": "ns3::HybridBuildingsPropagationLossModel",
+          "attributes": [
+            {
+              "name": "ShadowSigmaExtWalls",
+              "value": 1.0
+            },
+            {
+              "name": "ShadowSigmaOutdoor",
+              "value": 2.0
+            },
+            {
+              "name": "ShadowSigmaIndoor",
+              "value": 2.5
+            }
+          ]
+        },
+        "spectrumModel": {
+          "name": "ns3::MultiModelSpectrumChannel",
+          "attributes": []
+        }
+      }
+    }
+  ],
+  "macLayer": [
+    {
+      "type": "lte"
+    }
+  ],
+  "networkLayer": [
+    {
+      "type": "ipv4",
+      "address": "10.42.0.0",
+      "mask": "255.255.255.0",
+      "gateway": "10.42.0.3"
+    }
+  ],
+  "drones": [
+    {
+      "netDevices": [
+        {
+          "type": "lte",
+          "networkLayer": 0,
+          "role": "UE",
+          "bearers": [
+            {
+              "type": "GBR_CONV_VIDEO",
+              "bitrate": {
+                "guaranteed": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                },
+                "maximum": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                }
+              }
+            }
+          ],
+          "phy": {
+            "TxPower": 24.0,
+            "EnableUplinkPowerControl": false
+          }
+        }
+      ],
+      "mobilityModel": {
+        "name": "ns3::ConstantAccelerationDroneMobilityModel",
+        "attributes": [
+          {
+            "name": "Acceleration",
+            "value": 4.0
+          },
+          {
+            "name": "MaxSpeed",
+            "value": 15.0
+          },
+          {
+            "name": "FlightPlan",
+            "value": [
+              {
+                "position": [
+                  80.0,
+                  500.0,
+                  30.0
+                ],
+                "interest": 0,
+                "restTime": 3.0
+              },
+              {
+                "position": [
+                  500.0,
+                  500.0,
+                  30.0
+                ],
+                "interest": 1
+              },
+              {
+                "position": [
+                  920.0,
+                  500.0,
+                  30.0
+                ],
+                "interest": 0
+              }
+            ]
+          }
+        ]
+      },
+      "applications": [
+        {
+          "name": "ns3::TcpStorageClientApplication",
+          "attributes": [
+            {
+              "name": "StartTime",
+              "value": 1.0
+            },
+            {
+              "name": "StopTime",
+              "value": 89.0
+            },
+            {
+              "name": "Address",
+              "value": "200.0.0.1"
+            },
+            {
+              "name": "PayloadSize",
+              "value": 1024
+            }
+          ]
+        },
+        {
+          "name": "ns3::UavmaAuthApplication",
+          "attributes": [
+            {
+              "name": "StartTime",
+              "value": 1.0
+            },
+            {
+              "name": "StopTime",
+              "value": 88.0
+            },
+            {
+              "name": "Role",
+              "value": "UAV"
+            },
+            {
+              "name": "Domains",
+              "value": "GE"
+            },
+            {
+              "name": "PeerIp",
+              "value": "200.0.0.1"
+            },
+            {
+              "name": "PeerPort",
+              "value": 9000
+            },
+            {
+              "name": "LocalPort",
+              "value": 9000
+            },
+            {
+              "name": "TriggerPort",
+              "value": 9001
+            },
+            {
+              "name": "SeedTag",
+              "value": "e2r1"
+            },
+            {
+              "name": "GTargetId",
+              "value": "GS_T1"
+            },
+            {
+              "name": "ETargetId",
+              "value": "ES_T1"
+            },
+            {
+              "name": "OutputPrefix",
+              "value": "./results/e2_m3_loss_test_p/uavma/"
+            },
+            {
+              "name": "StorePath",
+              "value": "./results/e2_m3_loss_test_p/state/uav.db"
+            },
+            {
+              "name": "Verbose",
+              "value": false
+            },
+            {
+              "name": "TriggerGOnHandover",
+              "value": true
+            },
+            {
+              "name": "Variant",
+              "value": "P"
+            },
+            {
+              "name": "TestDropFirstM3",
+              "value": true
+            }
+          ]
+        }
+      ],
+      "mechanics": {
+        "name": "ns3::Drone",
+        "attributes": [
+          {
+            "name": "Mass",
+            "value": 0.75
+          },
+          {
+            "name": "RotorDiskArea",
+            "value": 0.18
+          },
+          {
+            "name": "DragCoefficient",
+            "value": 0.08
+          }
+        ]
+      },
+      "battery": {
+        "name": "ns3::energy::LiIonEnergySource",
+        "attributes": [
+          {
+            "name": "LiIonEnergySourceInitialEnergyJ",
+            "value": 5000.0
+          },
+          {
+            "name": "LiIonEnergyLowBatteryThreshold",
+            "value": 0.2
+          }
+        ]
+      },
+      "peripherals": [
+        {
+          "name": "ns3::StoragePeripheral",
+          "attributes": [
+            {
+              "name": "PowerConsumption",
+              "value": [
+                0,
+                1.0,
+                5.0
+              ]
+            },
+            {
+              "name": "Capacity",
+              "value": 3300000000
+            },
+            {
+              "name": "InitialRemainingCapacity",
+              "value": 3300000000
+            }
+          ]
+        },
+        {
+          "name": "ns3::InputPeripheral",
+          "attributes": [
+            {
+              "name": "PowerConsumption",
+              "value": [
+                0,
+                1.0,
+                5.0
+              ]
+            },
+            {
+              "name": "DataRate",
+              "value": 2000000.0
+            },
+            {
+              "name": "HasStorage",
+              "value": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "ZSPs": [
+    {
+      "netDevices": [
+        {
+          "type": "lte",
+          "role": "eNB",
+          "networkLayer": 0,
+          "bearers": [
+            {
+              "type": "GBR_CONV_VIDEO",
+              "bitrate": {
+                "guaranteed": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                },
+                "maximum": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                }
+              }
+            }
+          ],
+          "phy": {
+            "TxPower": 49.0
+          }
+        }
+      ],
+      "mobilityModel": {
+        "name": "ns3::ConstantPositionMobilityModel",
+        "attributes": [
+          {
+            "name": "Position",
+            "value": [
+              250.0,
+              500.0,
+              10.0
+            ]
+          }
+        ]
+      },
+      "applications": []
+    },
+    {
+      "netDevices": [
+        {
+          "type": "lte",
+          "role": "eNB",
+          "networkLayer": 0,
+          "bearers": [
+            {
+              "type": "GBR_CONV_VIDEO",
+              "bitrate": {
+                "guaranteed": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                },
+                "maximum": {
+                  "downlink": 50000000.0,
+                  "uplink": 20000000.0
+                }
+              }
+            }
+          ],
+          "phy": {
+            "TxPower": 49.0
+          }
+        }
+      ],
+      "mobilityModel": {
+        "name": "ns3::ConstantPositionMobilityModel",
+        "attributes": [
+          {
+            "name": "Position",
+            "value": [
+              750.0,
+              500.0,
+              10.0
+            ]
+          }
+        ]
+      },
+      "applications": []
+    }
+  ],
+  "remotes": [
+    {
+      "networkLayer": 0,
+      "applications": [
+        {
+          "name": "ns3::TcpEchoServerApplication",
+          "attributes": [
+            {
+              "name": "Address",
+              "value": "200.0.0.1"
+            }
+          ]
+        },
+        {
+          "name": "ns3::UavmaAuthApplication",
+          "attributes": [
+            {
+              "name": "StartTime",
+              "value": 1.0
+            },
+            {
+              "name": "StopTime",
+              "value": 88.0
+            },
+            {
+              "name": "Role",
+              "value": "TARGET"
+            },
+            {
+              "name": "Domains",
+              "value": "GE"
+            },
+            {
+              "name": "PeerPort",
+              "value": 9000
+            },
+            {
+              "name": "LocalPort",
+              "value": 9000
+            },
+            {
+              "name": "TriggerPort",
+              "value": 9001
+            },
+            {
+              "name": "SeedTag",
+              "value": "e2r1"
+            },
+            {
+              "name": "GTargetId",
+              "value": "GS_T1"
+            },
+            {
+              "name": "ETargetId",
+              "value": "ES_T1"
+            },
+            {
+              "name": "OutputPrefix",
+              "value": "./results/e2_m3_loss_test_p/uavma/"
+            },
+            {
+              "name": "StorePath",
+              "value": "./results/e2_m3_loss_test_p/state/target.db"
+            },
+            {
+              "name": "Verbose",
+              "value": false
+            },
+            {
+              "name": "EPeriodSec",
+              "value": 0.0
+            },
+            {
+              "name": "EStartSec",
+              "value": 8.0
+            },
+            {
+              "name": "GeInjectSec",
+              "value": -1.0
+            },
+            {
+              "name": "Variant",
+              "value": "P"
+            },
+            {
+              "name": "TestDropFirstM3",
+              "value": false
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "logComponents": [
+    "ReportSimulation",
+    "Scenario",
+    "SimulationDuration",
+    "Drone",
+    "DroneClientApplication",
+    "DroneServerApplication",
+    "LteEnbRrc",
+    "LteUeRrc",
+    "A3RsrpHandoverAlgorithm",
+    "LteHelper",
+    "UavmaAuthApplication"
+  ]
+}
