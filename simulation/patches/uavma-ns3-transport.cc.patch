@@ -1,0 +1,710 @@
+--- 05_patches/orig/uavma-ns3-transport.cc	2026-10-18 05:38:30.826744200 +0800
++++ 01_src/IoD_Sim/ns3/contrib/uavma/model/uavma-ns3-transport.cc	2026-10-18 05:48:04.801677700 +0800
+@@ -15,6 +15,8 @@
+ #include <ns3/boolean.h>
+ #include <ns3/double.h>
+ #include <ns3/inet-socket-address.h>
++#include <ns3/ipv4-interface-address.h>
++#include <ns3/ipv4.h>
+ #include <ns3/log.h>
+ #include <ns3/lte-ue-net-device.h>
+ #include <ns3/lte-ue-rrc.h>
+@@ -206,6 +208,21 @@
+ void UavmaRegistry::RecordIo(const UavmaIoEvent& e) {
+   io_.push_back(e);
+ }
++// E2-DISTRIBUTED (M4/D5): per-(transaction scope, message) emission ledger. Keyed by
++// "<wireKey>|<msg>" so that a retransmission lands in the SAME bucket as its first
++// emission. firstBytes therefore reconstructs a retransmission-free authentication;
++// totalBytes is everything actually put on the wire.
++void UavmaRegistry::RecordEmission(const std::string& key, size_t bytes, bool retrans) {
++  EmissionStat& s = emis_[key];
++  if (s.count == 0) s.firstBytes = bytes;
++  s.totalBytes += bytes;
++  if (retrans) s.retransBytes += bytes;
++  s.count += 1;
++}
++UavmaRegistry::EmissionStat UavmaRegistry::Emission(const std::string& key) const {
++  const auto it = emis_.find(key);
++  return it == emis_.end() ? EmissionStat{} : it->second;
++}
+ void UavmaRegistry::AddHandover(int64_t startNs, int64_t endNs, uint16_t targetCellId) {
+   hos_.push_back({startNs, endNs, static_cast<int64_t>(targetCellId)});
+ }
+@@ -218,7 +235,8 @@
+   // Historical traces are immutable: never silently truncate an existing run.
+   for (const auto& name : {"uavma_auth_completion.csv", "uavma_transport_metrics.csv",
+                            "uavma_handover.csv", "uavma_uav_state.csv",
+-                           "uavma_io_events.csv", "uavma_cpu_schedule.csv", "uavma_events.jsonl"}) {
++                           "uavma_io_events.csv", "uavma_cpu_schedule.csv", "uavma_events.jsonl",
++                           "uavma_send_ledger.csv"}) {
+     struct stat prior{};
+     if (::stat((dir_ + "/" + name).c_str(), &prior) == 0)
+       throw std::runtime_error("UAVMA refuses to overwrite existing run: " + dir_);
+@@ -229,6 +247,7 @@
+   fSt_.open(dir_ + "/uavma_uav_state.csv", std::ios::out | std::ios::trunc);
+   fIo_.open(dir_ + "/uavma_io_events.csv", std::ios::out | std::ios::trunc);
+   fCpu_.open(dir_ + "/uavma_cpu_schedule.csv", std::ios::out | std::ios::trunc);
++  fLed_.open(dir_ + "/uavma_send_ledger.csv", std::ios::out | std::ios::trunc);
+   fMsg_ << "tx_id,domain,event_type,trigger,msg,dir,send_sim_ms,recv_sim_ms,"
+            "transport_sim_ms,handler_cpu_us,framed_bytes,delivered,retrans\n";
+   fTx_ << "tx_id,domain,event_type,trigger,variant,sid,target_id,epoch,committed,branch,reason,"
+@@ -236,11 +255,16 @@
+           "committed_v,puf,sign,verify,mac,hash,ecdh,body_ul,body_dl,body_inf,body_mm,"
+           "framed_total,n_msg,trigger_recv_sim_ms,trigger_to_commit_sim_ms,"
+           "calibrated_service_us,calibrated_queue_us,cpu_resource_mode,e1_profile_sha256,"
+-          "infra_framed_total,infra_msg\n";
++          "infra_framed_total,infra_msg,"
++          "normal_auth_bytes,full_sent_auth_bytes,ul_auth_bytes,dl_auth_bytes,"
++          "infra_auth_bytes,total_auth_bytes,coord_bytes,app_retrans_bytes,"
++          "migration,intra_site_transfer,counterfactual_infra_bytes\n";
+   fHo_ << "ho_index,ho_start_sim_ms,ho_end_sim_ms,rrc_window_ms,target_cell_id,"
+           "proto_delivery_gap_ms,in_window_sent,in_window_delivered\n";
+   fSt_ << "sid,domain,uav_v,t_sim_ms\n";
+   fIo_ << "sim_ms,direction,retrans,msg,sid,bytes,dom,key\n";
++  fLed_ << "sim_ms,node,role,event,msg,dom,sid,tx_id,key,src_ip,src_port,dst_ip,dst_port,"
++           "port_class,dir,framed_bytes,on_wire,send_rc,retrans\n";
+   fCpu_ << "role,sid,domain,stages,arrival_sim_ms,start_sim_ms,finish_sim_ms,"
+            "calibrated_service_us,queue_wait_us,cpu_resource_mode,e1_profile_sha256\n";
+   fMsg_.flush();
+@@ -249,7 +273,8 @@
+   fSt_.flush();
+   fIo_.flush();
+   fCpu_.flush();
+-  return fMsg_.good() && fTx_.good() && fHo_.good() && fSt_.good() && fCpu_.good();
++  return fMsg_.good() && fTx_.good() && fHo_.good() && fSt_.good() && fCpu_.good() &&
++         fLed_.good();
+ }
+ void UavmaMetrics::Msg(const UavmaMsgRecord& m) {
+   if (!fMsg_.is_open()) return;
+@@ -274,9 +299,25 @@
+        << ',' << S(t.cpuResourceMode == "UNCALIBRATED" ? -1.0 : t.calibratedServiceNs / 1000.0)
+        << ',' << S(t.cpuResourceMode == "UNCALIBRATED" ? -1.0 : t.calibratedQueueNs / 1000.0)
+        << ',' << t.cpuResourceMode << ',' << t.e1ProfileSha256 << ','
+-       << t.infraFramed << ',' << t.infraMsg << '\n';
++       << t.infraFramed << ',' << t.infraMsg << ','
++       << t.normalAuthBytes << ',' << t.fullSentAuthBytes << ',' << t.ulAuthBytes << ','
++       << t.dlAuthBytes << ',' << t.infraAuthBytes << ','
++       << (t.ulAuthBytes + t.dlAuthBytes + t.infraAuthBytes) << ',' << t.coordBytes << ','
++       << t.appRetransBytes << ',' << (t.migration ? 1 : 0) << ','
++       << (t.intraSiteTransfer ? 1 : 0) << ',' << t.counterfactualInfraBytes << '\n';
+   fTx_.flush();
+ }
++// E2-DISTRIBUTED (M4): one row per real UDP emission attempt, written by the SENDER.
++// This is the primary evidence that reported bytes were actually transmitted.
++void UavmaMetrics::Ledger(const UavmaIoEvent& e) {
++  if (!fLed_.is_open()) return;
++  fLed_ << S(e.simNs / 1e6) << ',' << e.nodeId << ',' << e.role << ','
++        << (e.recv ? "RECV" : "SEND") << ',' << e.msg << ',' << e.dom << ',' << e.sid << ','
++        << e.txId << ',' << e.key << ',' << e.srcIp << ',' << e.srcPort << ',' << e.dstIp << ','
++        << e.dstPort << ',' << e.portClass << ',' << e.dir << ',' << e.bytes << ','
++        << (e.onWire ? 1 : 0) << ',' << e.sendRc << ',' << (e.retrans ? "R" : "-") << '\n';
++  fLed_.flush();
++}
+ void UavmaMetrics::Handover(int idx, int64_t startNs, int64_t endNs, uint16_t cellId,
+                             double protoGapMs, int inWindowSent, int inWindowDelivered) {
+   if (!fHo_.is_open()) return;
+@@ -316,6 +357,7 @@
+   if (fSt_.is_open()) fSt_.close();
+   if (fIo_.is_open()) fIo_.close();
+   if (fCpu_.is_open()) fCpu_.close();
++  if (fLed_.is_open()) fLed_.close();
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -425,7 +467,35 @@
+           .AddAttribute("MaxRetrans", "Maximum retransmissions per protocol message.",
+                         UintegerValue(3),
+                         MakeUintegerAccessor(&UavmaAuthApplication::m_maxRetrans),
+-                        MakeUintegerChecker<uint32_t>());
++                        MakeUintegerChecker<uint32_t>())
++          // ---- E2-DISTRIBUTED -------------------------------------------------
++          .AddAttribute("AllowForcedSameSiteReauth",
++                        "E2-DISTRIBUTED (M2): let a NON-migrating domain REALLY re-authenticate "
++                        "(real MM::authorize, real AuthzU, real AuthzS on the wire) instead of "
++                        "skipping it. State is re-installed on the SAME site and no Transfer "
++                        "datagram is fabricated. Off by default, so P and all legacy runs are "
++                        "bit-identical.",
++                        BooleanValue(false),
++                        MakeBooleanAccessor(&UavmaAuthApplication::m_allowForcedSameSiteReauth),
++                        MakeBooleanChecker())
++          .AddAttribute("Ho3AtSec",
++                        "E2-DISTRIBUTED (HO3): simulated time (s) of ONE controlled E-only "
++                        "logical target change. The G target and the LTE serving cell do not "
++                        "change and no RRC handover is triggered; negative disables the probe.",
++                        DoubleValue(-1.0),
++                        MakeDoubleAccessor(&UavmaAuthApplication::m_ho3AtSec),
++                        MakeDoubleChecker<double>())
++          .AddAttribute("Ho3ObserveSec",
++                        "E2-DISTRIBUTED (HO3): observation window (s) after the E-only change.",
++                        DoubleValue(1.0),
++                        MakeDoubleAccessor(&UavmaAuthApplication::m_ho3ObserveSec),
++                        MakeDoubleChecker<double>())
++          .AddAttribute("Ho3NewETarget",
++                        "E2-DISTRIBUTED (HO3): new logical E-domain target identifier "
++                        "(e.g. ES_T2); empty disables the probe.",
++                        StringValue(""),
++                        MakeStringAccessor(&UavmaAuthApplication::m_ho3NewETarget),
++                        MakeStringChecker());
+   return tid;
+ }
+ 
+@@ -632,11 +702,17 @@
+           {"initial_cell_id", I(m_currentCellId)},
+           {"logical_edge_assignment_only", "true"}});
+   }
++  // E2-DISTRIBUTED (HO3): one controlled E-only logical target change, scheduled at
++  // the same absolute simulated time on the UAV and on the MM. Only the MM dispatches
++  // the production authentication flow; the UAV only mirrors the logical E target so
++  // that AuthzU demultiplexing and the epoch check stay consistent.
++  InstallHo3Probe();
+ }
+ 
+ void UavmaAuthApplication::StopApplication() {
+   m_running = false;
+   if (m_periodicEvent.IsPending()) Simulator::Cancel(m_periodicEvent);
++  if (m_ho3ProbeEvent.IsPending()) Simulator::Cancel(m_ho3ProbeEvent);
+   for (auto& kv : m_mmAuthzRto)
+     if (kv.second.IsPending()) Simulator::Cancel(kv.second);
+   if (!m_isUav) {
+@@ -706,8 +782,9 @@
+   const uint32_t ip = m_peerFullAddr.Get();
+   for (int i = 0; i < 4; ++i) buf[9 + i] = static_cast<uint8_t>((ip >> (8 * i)) & 0xff);
+   for (const auto& entry : m_siteMap) {
+-    m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0,
+-                            InetSocketAddress(entry.second, m_triggerPort));
++    const Address to = InetSocketAddress(entry.second, m_triggerPort);
++    const int rc = m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0, to);
++    RecordCoordSend("peer_info", sizeof(buf), 'G', to, rc);
+   }
+   if (m_log)
+     m_log->event("peer_info_broadcast", {{"uav_ip", PnetIpStr(m_peerFullAddr)},
+@@ -727,8 +804,9 @@
+     buf[1 + i] = static_cast<uint8_t>((static_cast<uint64_t>(eventNs) >> (8 * i)) & 0xff);
+   buf[9] = static_cast<uint8_t>(eventKind);
+   for (const auto& ip : sites) {
+-    m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0,
+-                            InetSocketAddress(ip, m_triggerPort));
++    const Address to = InetSocketAddress(ip, m_triggerPort);
++    const int rc = m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0, to);
++    RecordCoordSend("event_info", sizeof(buf), 'G', to, rc);
+   }
+   if (m_log)
+     m_log->event("event_info_relayed", {{"event_ns", I(eventNs)},
+@@ -824,7 +902,8 @@
+   int64_t t = SimNs();
+   for (int i = 0; i < 8; ++i) buf[1 + i] = static_cast<uint8_t>((t >> (8 * i)) & 0xff);
+   Ptr<Packet> p = Create<Packet>(buf, 9);
+-  m_triggerSocket->SendTo(p, 0, to);
++  const int rc = m_triggerSocket->SendTo(p, 0, to);
++  RecordCoordSend("attach_trigger", 9, 'G', to, rc);
+ }
+ 
+ // Private ns-3 testbed metadata ONLY (type + 8-byte simulator time + 2-byte
+@@ -842,7 +921,8 @@
+   buf[10] = static_cast<uint8_t>((fromCell >> 8) & 0xffu);
+   buf[11] = static_cast<uint8_t>(toCell & 0xffu);
+   buf[12] = static_cast<uint8_t>((toCell >> 8) & 0xffu);
+-  m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0, to);
++  const int rc = m_triggerSocket->SendTo(Create<Packet>(buf, sizeof(buf)), 0, to);
++  RecordCoordSend("handover_trigger", sizeof(buf), 'G', to, rc);
+ }
+ 
+ bool UavmaAuthApplication::HasUnresolvedAuthentication() const {
+@@ -852,6 +932,53 @@
+   return false;
+ }
+ 
++// E2-DISTRIBUTED (M1): per-domain view used by the infrastructure message handlers.
++// A_JOINT authorizes G and E for the same event, so at the moment one domain's AuthzS
++// arrives the other domain's transaction is legitimately still open. The node-global
++// test rejected the SECOND domain's authorization even though its own domain was idle,
++// which silently dropped A_JOINT transactions. Scoping the test to the domain restores
++// the intended concurrency while keeping every per-domain check (an open transaction
++// of the SAME domain still blocks).
++bool UavmaAuthApplication::HasUnresolvedAuthentication(char dom) const {
++  for (const auto& entry : m_infraSess) {
++    if (entry.second.dom != dom) continue;
++    if (!entry.second.gotM3) return true;
++  }
++  return false;
++}
++
++std::string UavmaAuthApplication::RoleName() const {
++  return m_isUav ? "UAV" : m_isMm ? "MM" : m_isSite ? "SITE" : "INFRA";
++}
++
++// Best-effort own IPv4: the first non-loopback address of the first IPv4 interface.
++std::string UavmaAuthApplication::OwnIpv4() const {
++  Ptr<Node> node = GetNode();
++  if (!node) return "";
++  Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
++  if (!ipv4) return "";
++  for (uint32_t i = 1; i < ipv4->GetNInterfaces(); ++i) {
++    for (uint32_t j = 0; j < ipv4->GetNAddresses(i); ++j) {
++      const Ipv4InterfaceAddress a = ipv4->GetAddress(i, j);
++      if (a.GetLocal() != Ipv4Address::GetLoopback()) return PnetIpStr(a.GetLocal());
++    }
++  }
++  return "";
++}
++
++// E2-DISTRIBUTED (M4): sender-side evidence for one emission attempt. Every field is
++// taken from the actual Socket::SendTo call, so the ledger can be used to reconstruct
++// the reported byte totals independently of the CSV aggregates.
++void UavmaAuthApplication::RecordLedger(UavmaIoEvent& e, bool alsoRegistry) {
++  e.nodeId = GetNode()->GetId();
++  e.role = RoleName();
++  if (e.srcIp.empty()) e.srcIp = OwnIpv4();
++  // The io-events dump keeps its original meaning (on-wire protocol attempts only);
++  // the ledger is the complete sender record, including dropped or failed attempts.
++  if (alsoRegistry && e.onWire) UavmaRegistry::Instance().RecordIo(e);
++  m_metrics.Ledger(e);
++}
++
+ bool UavmaAuthApplication::ApplyPartitionDecision(const uavma_ns3::PartitionDecision& d) {
+   if (!m_partitionEnabled || d.sourceCell != m_currentCellId ||
+       m_eTargetId != d.sourceEdge) {
+@@ -883,6 +1010,102 @@
+   return true;
+ }
+ 
++// ---------------------------------------------------------------------------
++// E2-DISTRIBUTED (HO3): one controlled E-only logical target change.
++//
++// Same mechanism as the frozen E2 HO3 probe, adapted to the split P-NET roles:
++//   * the UAV mirrors the logical E target through ApplyPartitionDecision(), the same
++//     commit the natural A3 handover path uses, so AuthzU demultiplexing and the epoch
++//     check stay consistent;
++//   * the MM relays the event time to the involved sites and then calls
++//     BeginMobilityEventMm(), the production authorization dispatch, so AuthzU and
++//     AuthzS are really transmitted;
++//   * the G target and the LTE serving cell do NOT change, no RRC handover is
++//     triggered, and no G handover is fabricated. Under A_JOINT the existing Select()
++//     policy expands the E-only event to both domains; the G domain is then
++//     re-authenticated at its ORIGINAL site by the forced same-site path.
++// ---------------------------------------------------------------------------
++void UavmaAuthApplication::InstallHo3Probe() {
++  if (m_ho3AtSec < 0.0 || m_ho3NewETarget.empty()) return;  // probe disabled
++  if (!m_hasE) throw std::invalid_argument("HO3 probe requires the E domain");
++  if (!m_partitionEnabled)
++    throw std::invalid_argument("HO3 probe requires CellToEdgeMap partition mode");
++  if (m_ho3NewETarget == m_eTargetId)
++    throw std::invalid_argument("HO3 new E target must differ from the current E target");
++  if (!(m_ho3ObserveSec > 0.0))
++    throw std::invalid_argument("HO3 observation window must be positive");
++  if (m_ho3ProbeInstalled) return;
++  m_ho3ProbeInstalled = true;
++  if (m_log)
++    m_log->event("ho3_probe_configured", {{"role", RoleName()},
++                                          {"at_sec", S(m_ho3AtSec)},
++                                          {"observe_sec", S(m_ho3ObserveSec)},
++                                          {"from_e_target", m_eTargetId},
++                                          {"to_e_target", m_ho3NewETarget},
++                                          {"g_target_id", m_gTargetId},
++                                          {"cell_id", I(m_currentCellId)},
++                                          {"variant", m_variantName},
++                                          {"mechanism", "ho3_probe_controlled_injection"}});
++  m_ho3ProbeEvent = Simulator::Schedule(Seconds(m_ho3AtSec),
++                                        &UavmaAuthApplication::Ho3Fire, this);
++}
++
++void UavmaAuthApplication::Ho3Fire() {
++  if (!m_running) return;
++  uavma_ns3::PartitionDecision d;
++  d.event = uavma_ns3::Event::EOnly;
++  d.sourceCell = m_currentCellId;   // unchanged: NO LTE cell switch
++  d.targetCell = m_currentCellId;
++  d.sourceEdge = m_eTargetId;       // ES_T1
++  d.targetEdge = m_ho3NewETarget;   // ES_T2
++  d.targetG = m_gTargetId;          // GS_CELL_1, the ORIGINAL G site
++  d.edgeChanged = true;
++  if (m_isUav) {
++    const bool committed = ApplyPartitionDecision(d);
++    if (committed && m_log)
++      m_log->event("ho3_e_target_view_sync", {
++          {"domain", "E"}, {"e_target", m_eTargetId},
++          {"g_target_id", m_gTargetId}, {"cell_id", I(m_currentCellId)},
++          {"mechanism", "ho3_probe_controlled_injection"},
++          {"logical_assignment_only", "true"},
++          {"t_sim_ms", S(SimNs() / 1e6)}});
++    return;
++  }
++  if (!m_isMm) return;  // SITE roles only react to AuthzS / event info
++  const auto plan = uavma_ns3::Select(
++      m_variant.joint_trigger ? uavma_ns3::Variant::AJoint : uavma_ns3::Variant::P, d.event);
++  std::vector<Ipv4Address> sites;
++  const auto addSite = [&](const std::string& id) {
++    const auto it = m_siteMap.find(id);
++    if (it == m_siteMap.end())
++      throw std::invalid_argument("SiteMap missing deployment entry: " + id);
++    if (std::find(sites.begin(), sites.end(), it->second) == sites.end())
++      sites.push_back(it->second);
++  };
++  if (plan.g && m_hasG) {
++    addSite(uavma_ns3::GTargetForCell(d.sourceCell));
++    addSite(d.targetG);
++  }
++  if (plan.e && m_hasE) {
++    addSite(d.sourceEdge);
++    addSite(d.targetEdge);
++  }
++  const int64_t eventNs = SimNs();
++  RelayEventInfo(eventNs, static_cast<int>(d.event), sites);
++  if (m_log)
++    m_log->event("ho3_e_change", {
++        {"domain", "E"}, {"from", d.sourceEdge}, {"to", d.targetEdge},
++        {"g_target_id", d.targetG}, {"cell_id", I(m_currentCellId)},
++        {"trigger", "controlled_injection"},
++        {"mechanism", "ho3_probe"},
++        {"g_switch", "false"},
++        {"a_joint_policy", m_variant.joint_trigger ? "existing_select_expands_eonly_to_ge"
++                                                   : "not_applicable"},
++        {"logical_assignment_only", "true"},
++        {"t_sim_ms", S(SimNs() / 1e6)}});
++  BeginMobilityEventMm(static_cast<int>(d.event), d, eventNs);
++}
++
+ void UavmaAuthApplication::HandleTriggerRead(Ptr<Socket> socket) {
+   Address from;
+   while (Ptr<Packet> p = socket->RecvFrom(from)) {
+@@ -1315,6 +1538,47 @@
+                               &UavmaAuthApplication::OnInfraM2Rto, this, sid);
+ }
+ 
++// ---------------------------------------------------------------------------
++// E2-DISTRIBUTED (M4 / D5): unified byte accounting for ONE transaction.
++//
++// Every number is read back from the per-message emission ledger, which the sender
++// filled from the real Socket::SendTo calls. Nothing here estimates or hard-codes a
++// message length:
++//   * normal_auth_bytes  - one retransmission-free pass (each message counted ONCE);
++//   * full_sent_auth_bytes - every auth UDP payload actually put on the wire, ARQ included;
++//   * ul/dl/infra        - split by the real direction of each message;
++//   * app_retrans_bytes  - application-layer retransmission payload only.
++// If a message was never successfully sent, its contribution is 0 and a completed
++// "normal" figure is therefore never fabricated.
++// ---------------------------------------------------------------------------
++void UavmaAuthApplication::FillAccounting(UavmaTxRecord& t) {
++  const std::string domTag = std::string(1, t.domain);
++  const std::string authzKey = uavma_ns3::AuthzKey(t.domain, t.epoch);
++  const std::string infraKey = "INFRA|" + domTag + "|" + std::to_string(t.epoch);
++  auto& reg = UavmaRegistry::Instance();
++  const std::pair<std::string, std::string> msgs[] = {
++      {authzKey, "AuthzU"}, {infraKey, "AuthzS"}, {infraKey, "Transfer"},
++      {t.sid, "M0"},        {t.sid, "M1"},        {t.sid, "M2"}, {t.sid, "M3"}};
++  size_t normal = 0, full = 0, ul = 0, dl = 0, infra = 0, retrans = 0;
++  for (const auto& km : msgs) {
++    const auto s = reg.Emission(km.first + "|" + km.second);
++    if (s.count == 0) continue;  // never sent: contributes nothing, never invented
++    normal += s.firstBytes;
++    full += s.totalBytes;
++    retrans += s.retransBytes;
++    if (km.second == "M1" || km.second == "M3") ul += s.totalBytes;
++    else if (km.second == "AuthzS" || km.second == "Transfer") infra += s.totalBytes;
++    else dl += s.totalBytes;
++  }
++  t.normalAuthBytes = normal;
++  t.fullSentAuthBytes = full;
++  t.ulAuthBytes = ul;
++  t.dlAuthBytes = dl;
++  t.infraAuthBytes = infra;
++  t.appRetransBytes = retrans;
++  if (t.coordBytes == 0) t.coordBytes = m_coordBytes;
++}
++
+ void UavmaAuthApplication::OnM3(uint64_t txId, char dom, const uavma::M3Msg& m) {
+   UavmaDomainWorld& w = World(dom);
+   UavmaTxRecord& t = m_tx[txId];
+@@ -1367,6 +1631,7 @@
+                                                             "|" + std::to_string(t.epoch));
+   t.infraFramed = infra.bytes;
+   t.infraMsg = infra.datagrams;
++  FillAccounting(t);
+   uavma::OpCounters acc = UavmaRegistry::Instance().Counters(sid);
+   t.puf = acc.puf;
+   t.sign = acc.sign;
+@@ -1574,6 +1839,10 @@
+     UavmaRegistry::Instance().RecordSend(key, t);
+     if (!altKey.empty()) UavmaRegistry::Instance().RecordSend(altKey, t);
+     UavmaRegistry::Instance().RecordWireSend(wireKey.empty() ? sid : wireKey, framed.size());
++  }
++  // ---- E2-DISTRIBUTED (M4): per-datagram sender evidence + emission ledger ----
++  {
++    const std::string wireKeyUsed = !wireKey.empty() ? wireKey : (!altKey.empty() ? altKey : sid);
+     UavmaIoEvent e;
+     e.simNs = t;
+     e.recv = false;
+@@ -1582,8 +1851,22 @@
+     e.msg = msg;
+     e.bytes = framed.size();
+     e.dom = dom;
+-    e.key = wireKey.empty() ? (sid.empty() ? altKey : sid + "|" + msg) : wireKey;
+-    UavmaRegistry::Instance().RecordIo(e);
++    e.key = wireKeyUsed.empty() ? (sid + "|" + msg) : wireKeyUsed;
++    e.dir = dir.empty() ? std::string("DL") : dir;
++    e.portClass = m_localPort;
++    e.onWire = onWire;
++    e.sendRc = rc;
++    if (!sid.empty()) {
++      const auto txIt = m_sidToTx.find(sid);
++      if (txIt != m_sidToTx.end()) e.txId = txIt->second;
++    }
++    if (InetSocketAddress::IsMatchingType(to)) {
++      e.dstIp = PnetIpStr(InetSocketAddress::ConvertFrom(to).GetIpv4());
++      e.dstPort = InetSocketAddress::ConvertFrom(to).GetPort();
++    }
++    e.srcPort = m_localPort;
++    RecordLedger(e);
++    if (onWire) UavmaRegistry::Instance().RecordEmission(e.key + "|" + msg, framed.size(), isRetrans);
+   }
+   return t;
+ }
+@@ -1706,6 +1989,7 @@
+           "INFRA|" + std::string(1, t.domain) + "|" + std::to_string(t.epoch));
+       t.infraFramed = infra.bytes;
+       t.infraMsg = infra.datagrams;
++      FillAccounting(t);
+       if (t.reason.empty()) t.reason = "not committed before stop";
+       m_metrics.Tx(t);
+     }
+@@ -1732,20 +2016,59 @@
+   if (rc >= 0) {
+     UavmaRegistry::Instance().RecordSend(matchKey, t);
+     UavmaRegistry::Instance().RecordWireSend(wireKey, framed.size());
++  }
++  // ---- E2-DISTRIBUTED (M4): per-datagram sender evidence + emission ledger ----
++  {
+     UavmaIoEvent e;
+     e.simNs = t;
+     e.recv = false;
+     e.retrans = false;
+-    e.sid = "";
+     e.msg = msg;
+     e.bytes = framed.size();
+     e.dom = dom;
+-    e.key = matchKey;
+-    UavmaRegistry::Instance().RecordIo(e);
++    e.key = wireKey;
++    e.dir = "INFRA";
++    e.portClass = m_infraPort;
++    e.onWire = rc >= 0;
++    e.sendRc = rc;
++    if (InetSocketAddress::IsMatchingType(to)) {
++      e.dstIp = PnetIpStr(InetSocketAddress::ConvertFrom(to).GetIpv4());
++      e.dstPort = InetSocketAddress::ConvertFrom(to).GetPort();
++    }
++    e.srcPort = m_infraPort;
++    RecordLedger(e);
++    if (rc >= 0) UavmaRegistry::Instance().RecordEmission(wireKey + "|" + msg, framed.size(), false);
+   }
+   return t;
+ }
+ 
++// E2-DISTRIBUTED (M4): the port-9001 channel carries ONLY simulator plumbing
++// (attach / handover trigger / peer info / event info). It is recorded so that the
++// "coordination bytes" of a run can be reported, and it is never folded into any
++// authentication byte total.
++void UavmaAuthApplication::RecordCoordSend(const std::string& msg, size_t bytes, char dom,
++                                           const Address& to, int rc) {
++  if (rc < 0) return;  // a failed coordination datagram carries no bytes
++  m_coordBytes += bytes;
++  UavmaIoEvent e;
++  e.simNs = SimNs();
++  e.recv = false;
++  e.msg = msg;
++  e.bytes = bytes;
++  e.dom = dom;
++  e.key = "COORD";
++  e.dir = "COORD";
++  e.portClass = m_triggerPort;
++  e.onWire = true;
++  e.sendRc = rc;
++  if (InetSocketAddress::IsMatchingType(to)) {
++    e.dstIp = PnetIpStr(InetSocketAddress::ConvertFrom(to).GetIpv4());
++    e.dstPort = InetSocketAddress::ConvertFrom(to).GetPort();
++  }
++  e.srcPort = m_triggerPort;
++  RecordLedger(e, false);  // coordination traffic never enters the protocol io dump
++}
++
+ void UavmaAuthApplication::HandleInfraRead(Ptr<Socket> socket) {
+   Address from;
+   while (Ptr<Packet> p = socket->RecvFrom(from)) {
+@@ -1812,15 +2135,23 @@
+     return;
+   }
+   const auto dstIt = m_siteMap.find(m.target);
+-  if (dstIt == m_siteMap.end() || m.target == w.target->id()) {
++  // E2-DISTRIBUTED (M1): only THIS domain's open transaction blocks this domain.
++  if (HasUnresolvedAuthentication(dom)) {
+     if (m_log) m_log->event("authz_s_rejected", {{"domain", std::string(1, dom)},
+-                                                  {"reason", "unroutable_or_self_target"},
+-                                                  {"target", m.target}});
++                                                 {"reason", "unresolved_domain_authentication"}});
+     return;
+   }
+-  if (HasUnresolvedAuthentication()) {
++  if (dstIt == m_siteMap.end()) {
+     if (m_log) m_log->event("authz_s_rejected", {{"domain", std::string(1, dom)},
+-                                                  {"reason", "unresolved_domain_authentication"}});
++                                                 {"reason", "unroutable_target"},
++                                                 {"target", m.target}});
++    return;
++  }
++  // E2-DISTRIBUTED (M2/M3): this node ALREADY hosts the authorized target, i.e. the
++  // domain does not migrate. A_JOINT still requires the domain to authenticate, so the
++  // state is re-installed here, in-site, with NO Transfer datagram on the wire.
++  if (m.target == w.target->id()) {
++    BeginSameSiteReinstall(dom, m);
+     return;
+   }
+   // Build the Transfer from THIS node's committed/pending state exactly as the legacy
+@@ -1830,6 +2161,9 @@
+   src.set_pending(w.target->pi() ? std::optional<uavma::Pending>(*w.target->pi()) : std::nullopt);
+   const uavma::TransferMsg tr = src.build_transfer(m.target, m.epoch);
+   const Address to = InetSocketAddress(dstIt->second, m_infraPort);
++  // E2-DISTRIBUTED (M3): a REAL cross-site Transfer; its bytes are counted normally.
++  m_intraSiteTransfer[dom] = false;
++  m_counterfactualInfra[dom] = 0;
+   SendInfraProtocol(uavma::Framing::encode(uavma::MsgKind::Transfer, tr.to_bytes()), "Transfer",
+                     "Transfer|" + domTag, "INFRA|" + domTag, dom, to);
+   if (m_log) m_log->event("transfer_sent", {{"domain", std::string(1, dom)},
+@@ -1841,6 +2175,64 @@
+                                             {"t_sim_ms", S(SimNs() / 1e6)}});
+ }
+ 
++// ---------------------------------------------------------------------------
++// E2-DISTRIBUTED (M2 + M3): forced re-authentication of a NON-migrating domain.
++//
++// A_JOINT's Select() returns {G,E} for every event, including events where only one
++// domain actually changes target. For the domain that does NOT migrate, the paper's
++// semantics still require a fresh authentication, so this path REALLY runs:
++//   * the MM has already advanced the epoch and really sent AuthzU (9000) + AuthzS (9002);
++//   * this node really builds the protocol Transfer with the same SourceCore encoding;
++//   * the state is really re-installed through TargetCore::accept_transfer, with the
++//     SAME target_create_session_M0 CPU cost reserved as in the cross-site path.
++// What does NOT happen: no target core is created, no cell/target switch occurs, no
++// handover is fabricated, and NO Transfer datagram is emitted (the state never leaves
++// the node). The bytes such a datagram WOULD have used are derived from the real
++// encoding and recorded as a counterfactual, never as sent bytes.
++// ---------------------------------------------------------------------------
++void UavmaAuthApplication::BeginSameSiteReinstall(char dom, const uavma::AuthzSMsg& m) {
++  UavmaDomainWorld& w = World(dom);
++  if (m_log)
++    m_log->event("forced_same_site_reauth", {{"domain", std::string(1, dom)},
++                                             {"target", m.target},
++                                             {"epoch", I(static_cast<long long>(m.epoch))},
++                                             {"migration", "false"},
++                                             {"mechanism", "a_joint_non_migrating_domain"},
++                                             {"t_sim_ms", S(SimNs() / 1e6)}});
++  if (m_triggerRecvNs < 0) {
++    if (m_log) m_log->event("same_site_reauth_rejected", {{"domain", std::string(1, dom)},
++                                                          {"reason", "event_info_not_received"}});
++    return;
++  }
++  // Identical construction to the cross-site path, so the counterfactual size is a
++  // DERIVED quantity: the real serialization result, not a hard-coded constant.
++  uavma::SourceCore src(w.d, w.target->pid());
++  src.set_committed(w.target->sc());
++  src.set_pending(w.target->pi() ? std::optional<uavma::Pending>(*w.target->pi()) : std::nullopt);
++  const uavma::TransferMsg tr = src.build_transfer(m.target, m.epoch);
++  const size_t wouldBe = uavma::Framing::encode(uavma::MsgKind::Transfer, tr.to_bytes()).size();
++  m_intraSiteTransfer[dom] = true;
++  m_counterfactualInfra[dom] = wouldBe;
++  if (m_log)
++    m_log->event("intra_site_transfer_installed", {
++        {"domain", std::string(1, dom)}, {"target", m.target},
++        {"epoch", I(static_cast<long long>(m.epoch))},
++        {"counterfactual_infra_bytes", I(static_cast<long long>(wouldBe))},
++        {"wire_bytes_sent", I(0)},
++        {"derivation", "framing_encode_of_real_transfer_not_hardcoded"},
++        {"t_sim_ms", S(SimNs() / 1e6)}});
++  w.target->accept_transfer(tr);
++  if (!m_cpuCalibrated) {
++    SiteCreateSession(tr, dom, {});
++    return;
++  }
++  // The in-site computation cost is NOT omitted even though nothing is transmitted.
++  const auto slot = ReserveCpu(dom, {"target_create_session_M0"}, "");
++  Simulator::Schedule(NanoSeconds(slot.delayNs), [this, tr, dom, slot]() {
++    if (m_running) SiteCreateSession(tr, dom, slot);
++  });
++}
++
+ // Target site: the paper's Src -> T Transfer arrived; install state, open session, emit M0.
+ void UavmaAuthApplication::OnTransfer(const uavma::TransferMsg& m, char dom, size_t framedBytes) {
+   UavmaDomainWorld& w = World(dom);
+@@ -1857,7 +2249,8 @@
+                                                    {"target", m.target}});
+     return;
+   }
+-  if (HasUnresolvedAuthentication()) {
++  // E2-DISTRIBUTED (M1): only THIS domain's open transaction blocks this domain.
++  if (HasUnresolvedAuthentication(dom)) {
+     if (m_log) m_log->event("transfer_rejected", {{"domain", std::string(1, dom)},
+                                                   {"reason", "unresolved_domain_authentication"}});
+     return;
+@@ -1867,6 +2260,9 @@
+                                                   {"reason", "event_info_not_received"}});
+     return;
+   }
++  // A cross-site Transfer really arrived, so the state installation is NOT in-site.
++  m_intraSiteTransfer[dom] = false;
++  m_counterfactualInfra[dom] = 0;
+   // Install the transferred committed/pending state exactly like the legacy path.
+   w.target->accept_transfer(m);
+   if (!m_cpuCalibrated) {
+@@ -1910,6 +2306,13 @@
+   tx.bodyMm = au.account().body + as.account().body;
+   tx.bodyInf = t.account().body;
+   tx.bodyDl = m0.account().body;
++  // E2-DISTRIBUTED (M3): record HOW this transaction's state was installed.
++  const auto intraIt = m_intraSiteTransfer.find(dom);
++  tx.migration = !(intraIt != m_intraSiteTransfer.end() && intraIt->second);
++  tx.intraSiteTransfer = !tx.migration;
++  const auto cfIt = m_counterfactualInfra.find(dom);
++  tx.counterfactualInfraBytes = cfIt == m_counterfactualInfra.end() ? 0 : cfIt->second;
++  tx.coordBytes = m_coordBytes;
+   m_tx[tx.id] = tx;
+   m_sidToTx[sid] = tx.id;
+   m_sidDomain[sid] = dom;
+@@ -1946,12 +2349,29 @@
+         (dom == 'G') ? uavma_ns3::GTargetForCell(d.sourceCell) : d.sourceEdge;
+     const auto srcIt = m_siteMap.find(srcTarget);
+     const auto dstIt = m_siteMap.find(newTarget);
+-    if (srcIt == m_siteMap.end() || dstIt == m_siteMap.end() || srcTarget == newTarget) {
++    // E2-DISTRIBUTED (M2): a domain whose target does NOT change is skipped unless the
++    // run explicitly asks for the forced same-site re-authentication that A_JOINT's
++    // policy implies. Both variants keep the same authorization state machine.
++    const bool nonMigrating = (srcTarget == newTarget);
++    if (srcIt == m_siteMap.end() || dstIt == m_siteMap.end()) {
+       if (m_log) m_log->event("pnet_authorize_rejected", {
+           {"domain", std::string(1, dom)}, {"reason", "unroutable_site_pair"},
+           {"source_target", srcTarget}, {"target", newTarget}});
+       return;
+     }
++    if (nonMigrating && !(m_allowForcedSameSiteReauth && m_variant.joint_trigger)) {
++      if (m_log) m_log->event("pnet_authorize_rejected", {
++          {"domain", std::string(1, dom)}, {"reason", "non_migrating_domain_not_selected"},
++          {"source_target", srcTarget}, {"target", newTarget},
++          {"variant", m_variantName}});
++      return;
++    }
++    if (nonMigrating && m_log)
++      m_log->event("forced_same_site_reauth_authorized", {
++          {"domain", std::string(1, dom)}, {"target", newTarget},
++          {"migration", "false"}, {"variant", m_variantName},
++          {"site", PnetIpStr(srcIt->second)},
++          {"authz_s_will_be_sent", "true"}, {"t_sim_ms", S(SimNs() / 1e6)}});
+     const uint64_t epoch = w.mm->authorize(newTarget);
+     const uavma::AuthzUMsg au = w.mm->authz_u();
+     const uavma::AuthzSMsg as = w.mm->authz_s(w.pid);
+@@ -1970,6 +2390,7 @@
+     if (m_log) m_log->event("pnet_authorized", {
+         {"domain", std::string(1, dom)}, {"epoch", I(static_cast<long long>(epoch))},
+         {"source_target", srcTarget}, {"target", newTarget},
++        {"migration", nonMigrating ? "false" : "true"},
+         {"source_site", PnetIpStr(srcIt->second)}, {"t_sim_ms", S(SimNs() / 1e6)}});
+   };
+   if (plan.g && m_hasG) begin('G');

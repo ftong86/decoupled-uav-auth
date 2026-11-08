@@ -1,0 +1,15 @@
+--- E5_V1/main.cc
++++ E5_V1_1/main.cc
+@@ -223,7 +223,11 @@
+ {
+     RngSeedManager::SetRun(1);
+     RngSeedManager::SetSeed(33);
+-    Config::SetDefault("ns3::RandomVariableStream::Stream", IntegerValue(1));
++    // E5 only: ns-3 must assign distinct random streams to concurrent UEs.
++    // A forced common Stream=1 replays identical UE random-access draws,
++    // potentially causing deterministic LTE RACH collisions when N > 1.
++    // The RngSeed/RngRun command-line controls remain unchanged.
++    Config::SetDefault("ns3::RandomVariableStream::Stream", IntegerValue(-1));
+     Config::SetDefault("ns3::ThreeGppChannelModel::UpdatePeriod",
+                        TimeValue(MilliSeconds(1))); // update the channel at each iteration
+     Config::SetDefault("ns3::ThreeGppChannelConditionModel::UpdatePeriod",

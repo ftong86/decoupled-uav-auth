@@ -1,0 +1,25 @@
+--- E5_V1_2/IoD_Sim/src/main.cc
++++ E5_V2/IoD_Sim/src/main.cc
+@@ -1207,11 +1207,17 @@
+         }
+     }
+ 
+-    for (NodeContainer::Iterator eNB = backbonePerStack[netId].Begin();
+-         eNB != backbonePerStack[netId].End();
+-         eNB++)
+-    {
+-        ltePhy->GetLteHelper()->AddX2Interface(entityNode, *eNB);
++    // E5 V2 ONLY: ZSPs are generated in consecutive three-cell corridor groups.
++    // Preserve the complete X2 mesh WITHIN a corridor (3 cells), but do not
++    // build a quadratic all-to-all X2 mesh between geographically separated
++    // corridors. This changes network deployment, NOT the LTE A3 protocol.
++    // In particular, for the original single corridor the links are identical.
++    const uint32_t existingEnbs = backbonePerStack[netId].GetN();
++    const uint32_t clusterFirst = (existingEnbs / 3u) * 3u;
++    for (uint32_t prior = clusterFirst; prior < existingEnbs; ++prior)
++    {
++        ltePhy->GetLteHelper()->AddX2Interface(entityNode,
++                                                 backbonePerStack[netId].Get(prior));
+     }
+     backbonePerStack[netId].Add(entityNode);
+ }

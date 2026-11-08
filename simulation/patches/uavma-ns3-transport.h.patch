@@ -1,0 +1,157 @@
+--- 05_patches/orig/uavma-ns3-transport.h	2026-10-18 05:38:31.125314800 +0800
++++ 01_src/IoD_Sim/ns3/contrib/uavma/model/uavma-ns3-transport.h	2026-10-18 05:47:51.808013700 +0800
+@@ -63,6 +63,18 @@
+   size_t bytes = 0;      // actual framed UDP payload bytes of this emission
+   char dom = 'G';        // domain of the emission
+   std::string key;       // correlation key (sid|msg, AuthzU|dom|epoch, INFRA|dom|epoch)
++  // ---- E2-DISTRIBUTED (M4): per-datagram sender evidence -------------------
++  uint32_t nodeId = 0;     // ns-3 node id of the recording application
++  std::string role;        // UAV | MM | SITE | INFRA
++  std::string dir;         // UL | DL | INFRA | COORD
++  std::string srcIp;       // sender IPv4 (best effort, "" if unresolvable)
++  uint16_t srcPort = 0;    // sender UDP port (0 if unbound)
++  std::string dstIp;       // receiver IPv4
++  uint16_t dstPort = 0;    // receiver UDP port
++  uint16_t portClass = 0;  // 9000 = UAV-facing protocol, 9001 = coordination, 9002 = infra
++  bool onWire = true;      // false only for the explicitly labeled D-6 M3 drop probe
++  int sendRc = 0;          // return code of Socket::SendTo
++  uint64_t txId = 0;       // owning transaction, when known at send time
+ };
+ 
+ class UavmaRegistry {
+@@ -77,6 +89,20 @@
+   void RecordWireSend(const std::string& sid, size_t framedBytes);
+   uavma_ns3::WireUsage WireUsageFor(const std::string& sid) const;
+ 
++  // ---- E2-DISTRIBUTED (M4): per-message emission ledger --------------------
++  // One entry per (transaction-scoped wire key, message kind). firstBytes is the
++  // size of the FIRST on-wire emission, so a "normal" (retransmission-free)
++  // authentication can be reconstructed by summing them; totalBytes counts every
++  // real emission including application-layer retransmissions.
++  struct EmissionStat {
++    size_t firstBytes = 0;
++    size_t totalBytes = 0;
++    size_t retransBytes = 0;
++    uint64_t count = 0;
++  };
++  void RecordEmission(const std::string& key, size_t bytes, bool retrans);
++  EmissionStat Emission(const std::string& key) const;
++
+   void AddCpuUs(const std::string& sid, double cpuUs);
+   double CpuUs(const std::string& sid) const;
+   void AddCalibratedCpu(const std::string& sid, int64_t serviceNs, int64_t queueNs);
+@@ -101,6 +127,7 @@
+   std::map<std::string, double> cpu_;
+   std::map<std::string, std::pair<int64_t, int64_t>> calibrated_;
+   std::map<std::string, uint32_t> retrans_;
++  std::map<std::string, EmissionStat> emis_;
+   std::map<std::string, uavma::OpCounters> cnt_;
+   std::vector<UavmaIoEvent> io_;
+   std::vector<std::array<int64_t, 3>> hos_;  // {startNs, endNs, targetCellId}
+@@ -135,6 +162,19 @@
+   size_t nMsg = 0;  // attempted on-wire UDP authentication datagrams, including retries
+   size_t infraFramed = 0;  // P-NET: actual infrastructure-to-infrastructure framed bytes sent
+   size_t infraMsg = 0;     // P-NET: count of infrastructure-to-infrastructure datagrams sent
++  // ---- E2-DISTRIBUTED (M4 / D5): unified byte accounting --------------------
++  size_t normalAuthBytes = 0;   // one retransmission-free pass: each message counted ONCE
++  size_t fullSentAuthBytes = 0; // every auth UDP payload actually put on the wire
++  size_t ulAuthBytes = 0;       // UAV -> infrastructure (M1, M3)
++  size_t dlAuthBytes = 0;       // infrastructure -> UAV (AuthzU, M0, M2)
++  size_t infraAuthBytes = 0;    // infrastructure -> infrastructure (AuthzS, Transfer)
++  size_t appRetransBytes = 0;   // application-layer ARQ payload only
++  size_t coordBytes = 0;        // simulator coordination traffic on port 9001 (excluded)
++  bool migration = true;        // false = forced re-authentication of a NON-migrating domain
++  bool intraSiteTransfer = false;  // state re-installed on the SAME site (no wire datagram)
++  // Bytes the SAME-SITE Transfer WOULD have occupied had it been a cross-site send.
++  // Derived from the real encoding, never hard-coded; NEVER counted as sent bytes.
++  size_t counterfactualInfraBytes = 0;
+ };
+ 
+ // Per-message transport record (one row per delivered protocol message).
+@@ -165,6 +205,8 @@
+   // Full send/receive event dump: lets a lost datagram be distinguished from a
+   // datagram that was never emitted. Evidence for failure localisation.
+   void IoEvents(const std::vector<UavmaIoEvent>& ev);
++  // E2-DISTRIBUTED (M4): one row per real UDP emission attempt (sender evidence).
++  void Ledger(const UavmaIoEvent& e);
+   void UavState(const std::string& sid, char dom, uint32_t v, int64_t simNs);
+   void CpuSchedule(const std::string& role, const std::string& sid, char dom,
+                    const std::string& stage, const uavma_ns3::CpuReservation& plan,
+@@ -174,7 +216,7 @@
+ 
+  private:
+   std::string dir_;
+-  std::ofstream fMsg_, fTx_, fHo_, fSt_, fIo_, fCpu_;
++  std::ofstream fMsg_, fTx_, fHo_, fSt_, fIo_, fCpu_, fLed_;
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -252,7 +294,13 @@
+   void SendTrigger(uint8_t type);
+   void SendHandoverTrigger(std::uint16_t fromCell, std::uint16_t toCell);
+   bool ApplyPartitionDecision(const uavma_ns3::PartitionDecision& plan);
++  // Node-global view: ANY domain of this node still has an unresolved transaction.
++  // Used by ApplyPartitionDecision; its semantics are deliberately left unchanged.
+   bool HasUnresolvedAuthentication() const;
++  // E2-DISTRIBUTED (M1): per-domain view. A_JOINT starts G and E concurrently, so
++  // one domain's open transaction must not block the other domain's authorization
++  // or transfer. Every pre-existing security check is preserved, only scoped.
++  bool HasUnresolvedAuthentication(char dom) const;
+   void RecordRecvCommon(UavmaMsgRecord& r, const std::string& sid, const std::string& key);
+ 
+   UavmaDomainWorld& World(char dom);
+@@ -284,6 +332,25 @@
+   void RelayEventInfo(int64_t eventNs, int eventKind, const std::vector<Ipv4Address>& sites);
+   void OnMmAuthzRto(std::string key);
+ 
++  // ---- E2-DISTRIBUTED -------------------------------------------------------
++  // M2/M3: strictly controlled re-authentication of a NON-migrating domain.
++  // The domain really runs MM::authorize + AuthzU + AuthzS across the network and
++  // really re-installs its state; no new target core, no cell change, no fabricated
++  // handover, and no security check is relaxed.
++  void BeginSameSiteReinstall(char dom, const uavma::AuthzSMsg& m);
++  // M4: sender-side evidence for one UDP emission attempt.
++  void RecordLedger(UavmaIoEvent& e, bool alsoRegistry = true);
++  // M4: one datagram on the port-9001 simulator coordination channel. Reported
++  // separately and NEVER folded into any authentication byte total.
++  void RecordCoordSend(const std::string& msg, size_t bytes, char dom, const Address& to,
++                       int rc = 1);
++  std::string OwnIpv4() const;
++  std::string RoleName() const;
++  void FillAccounting(UavmaTxRecord& t);
++  // HO3: one controlled E-only logical target change, no G switch, no RRC handover.
++  void InstallHo3Probe();
++  void Ho3Fire();
++
+   // ---- bounded retransmission (application-level ARQ).
+   // Retransmissions reuse the cached protocol message, so they take the protocol's
+   // cached-retry path: no additional PUFEval, no additional signature.
+@@ -319,6 +386,14 @@
+   std::string m_siteMapText;  // P-NET: "TARGET=IP,..." static deployment map (infra roles)
+   std::string m_hostTargets;  // P-NET SITE: the single target identity hosted here
+   uint16_t m_infraPort = 9002;  // P-NET: infrastructure-to-infrastructure UDP port
++  // ---- E2-DISTRIBUTED -------------------------------------------------------
++  // M2: allow A_JOINT to really re-authenticate a domain whose target does NOT
++  // change. Off by default so the legacy/P deployment behaviour is bit-identical.
++  bool m_allowForcedSameSiteReauth = false;
++  // HO3: controlled E-only logical target change (mirrors the frozen E2 probe).
++  double m_ho3AtSec = -1.0;
++  double m_ho3ObserveSec = 1.0;
++  std::string m_ho3NewETarget;
+ 
+   // ---- runtime
+   bool m_isUav = false;
+@@ -378,6 +453,13 @@
+   std::map<std::string, UavSess> m_uavSess;
+   std::map<std::string, InfraSess> m_infraSess;
+   std::map<std::string, uavma::Bytes> m_frames;  // "sid|msg" -> framed bytes for retransmit
++  // ---- E2-DISTRIBUTED -------------------------------------------------------
++  // M3: per-domain record of how the state for this epoch was installed.
++  std::map<char, bool> m_intraSiteTransfer;       // true = same-site reinstall, no wire send
++  std::map<char, size_t> m_counterfactualInfra;   // bytes a cross-site Transfer would have used
++  size_t m_coordBytes = 0;                        // port-9001 traffic emitted by THIS node
++  bool m_ho3ProbeInstalled = false;
++  EventId m_ho3ProbeEvent;
+   double m_rtoMs = 250.0;
+   uint32_t m_maxRetrans = 3;
+   int64_t m_hoStartNs = -1;
